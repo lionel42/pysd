@@ -58,10 +58,10 @@ class Cache(object):
         def cached_func(*args):
             """Run wise cache function"""
             try:  # fails if cache is not instantiated
-                return self.data['run'][func.__name__]
+                return self.data['run'][func]
             except KeyError:
                 value = func(*args)
-                self.data['run'][func.__name__] = value
+                self.data['run'][func] = value
                 return value
         return cached_func
 
@@ -74,11 +74,11 @@ class Cache(object):
         def cached_func(*args):
             """Step wise cache function"""
             try:  # fails if cache is not instantiated or if it is None
-                value = self.data['step'][func.__name__]
+                value = self.data['step'][func]
                 assert value is not None
             except (KeyError, AssertionError):
                 value = func(*args)
-                self.data['step'][func.__name__] = value
+                self.data['step'][func] = value
             return value
         return cached_func
 

@@ -145,4 +145,4 @@ def load(py_model_file, initialize=True, missing_values="warning"):
 
     """
 
-    return Model(py_model_file, initialize, missing_values)
+    return Model(str(py_model_file), initialize, missing_values)

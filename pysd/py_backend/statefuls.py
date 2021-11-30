@@ -584,7 +584,7 @@ class Macro(DynamicStateful):
     (as opposed to a macro or submodel within another model) it will have
     added methods to facilitate execution.
     """
-
+    time: Time
     def __init__(self, py_model_file, params=None, return_func=None,
                  time=None, time_initialization=None, py_name=None):
         """

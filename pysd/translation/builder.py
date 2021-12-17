@@ -27,9 +27,11 @@ class Imports():
     Class to save the imported modules information for intelligent import
     """
     _numpy, _xarray, _subs = False, False, False
-    _functions, _statefuls, _external, _utils = set(), set(), set(), set()
+    _functions, _statefuls, _external, _data, _utils =\
+        set(), set(), set(), set(), set()
     _external_libs = {"numpy": "np", "xarray": "xr"}
-    _internal_libs = ["functions", "statefuls", "external", "utils"]
+    _internal_libs = [
+        "functions", "statefuls", "external", "data", "utils"]
 
     @classmethod
     def add(cls, module, function=None):
@@ -51,7 +53,7 @@ class Imports():
             setattr(cls, f"_{module}", True)
 
     @classmethod
-    def get_header(cls, outfile, force_root=False):
+    def get_header(cls, outfile):
         """
         Returns the importing information to print in the model file
 
@@ -59,12 +61,6 @@ class Imports():
         ----------
         outfile: str
             Name of the outfile to print in the header.
-
-        force_root: bool (optional)
-            If True, the _root variable will be returned to include in the
-            model file and os.path will be imported. If False, the _root
-            variable will only be included if the model has External
-            objects.
 
         Returns
         -------
@@ -75,12 +71,7 @@ class Imports():
         text =\
             f'"""\nPython model \'{outfile}\'\nTranslated using PySD\n"""\n\n'
 
-        _root = ""
-
-        if cls._external or force_root:
-            # define root only if needed
-            text += "from os import path\n"
-            _root = "\n    _root = path.dirname(__file__)\n"
+        text += "from pathlib import Path\n"
 
         for module, shortname in cls._external_libs.items():
             if getattr(cls, f"_{module}"):
@@ -100,7 +91,7 @@ class Imports():
 
         cls.reset()
 
-        return text, _root
+        return text
 
     @classmethod
     def reset(cls):
@@ -108,7 +99,8 @@ class Imports():
         Reset the imported modules
         """
         cls._numpy, cls._xarray, cls._subs = False, False, False
-        cls._functions, cls._external, cls._utils = set(), set(), set()
+        cls._functions, cls._statefuls, cls._external, cls._data,\
+            cls._utils = set(), set(), set(), set(), set()
 
 
 # Variable to save identifiers of external objects
@@ -173,7 +165,7 @@ def build_modular_model(elements, subscript_dict, namespace, dependencies,
             subview_elems = []
             for element in elements:
                 if element.get("py_name") in view_content or \
-                   element.get("parent_name", None) in view_content:
+                   element.get("parent_name") in view_content:
                     subview_elems.append(element)
 
             _build_separate_module(subview_elems, subscript_dict,
@@ -266,8 +258,7 @@ def _build_main_module(elements, subscript_dict, file_name):
     Imports.add("utils", "load_modules")
 
     # import of needed functions and packages
-    text, root = Imports.get_header(os.path.basename(file_name),
-                                    force_root=True)
+    text = Imports.get_header(os.path.basename(file_name))
 
     # import namespace from json file
     text += textwrap.dedent("""
@@ -277,12 +268,13 @@ def _build_main_module(elements, subscript_dict, file_name):
         'scope': None,
         'time': lambda: 0
     }
-    %(root)s
+
+    _root = Path(__file__).parent
+
     _namespace, _subscript_dict, _dependencies, _modules = load_model_data(
         _root, "%(outfile)s")
     """ % {
         "outfile": os.path.basename(file_name).split(".")[0],
-        "root": root,
         "version": __version__
     })
 
@@ -396,7 +388,7 @@ def build(elements, subscript_dict, namespace, dependencies, outfile_name):
     # separating between control variables and rest of variables
     control_vars, funcs = _build_variables(elements, subscript_dict)
 
-    text, root = Imports.get_header(os.path.basename(outfile_name))
+    text = Imports.get_header(os.path.basename(outfile_name))
 
     text += textwrap.dedent("""
     __pysd_version__ = '%(version)s'
@@ -405,7 +397,9 @@ def build(elements, subscript_dict, namespace, dependencies, outfile_name):
         'scope': None,
         'time': lambda: 0
     }
-    %(root)s
+
+    _root = Path(__file__).parent
+
     _subscript_dict = %(subscript_dict)s
 
     _namespace = %(namespace)s
@@ -415,7 +409,6 @@ def build(elements, subscript_dict, namespace, dependencies, outfile_name):
         "subscript_dict": repr(subscript_dict),
         "namespace": repr(namespace),
         "dependencies": repr(dependencies),
-        "root": root,
         "version": __version__,
     })
 
@@ -602,7 +595,10 @@ def build_element(element, subscript_dict):
     # external objecets via .add method
     py_expr_no_ADD = ["ADD" not in py_expr for py_expr in element["py_expr"]]
 
-    if sum(py_expr_no_ADD) > 1 and element["kind"] not in [
+    if element["kind"] == "dependencies":
+        # element only used to update dependencies
+        return ""
+    elif sum(py_expr_no_ADD) > 1 and element["kind"] not in [
         "stateful",
         "external",
         "external_add",
@@ -646,8 +642,8 @@ def build_element(element, subscript_dict):
         # to rewrite subscripted values with model.run(params=X) or
         # model.run(initial_condition=(n,x))
         element["subs_doc"] = "%s" % element["merge_subs"]
-        if element["kind"] in ["component", "setup",
-                               "constant", "component_ext_data"]:
+        if element["kind"] in ["component", "setup", "constant",
+                               "component_ext_data", "data"]:
             # the decorator is not always necessary as the objects
             # defined as xarrays in the model will have the right
             # dimensions always, we should try to reduce to the
@@ -669,7 +665,7 @@ def build_element(element, subscript_dict):
     # convert newline indicator and add expected level of indentation
     element["doc"] = element["doc"].replace("\\", "\n").replace("\n", "\n    ")
 
-    if element["kind"] in ["stateful", "external"]:
+    if element["kind"] in ["stateful", "external", "tab_data"]:
         func = """
     %(py_name)s = %(py_expr)s
             """ % {
@@ -744,52 +740,53 @@ def merge_partial_elements(element_list):
     outs = dict()  # output data structure
 
     for element in element_list:
-        if element["py_expr"] != "None":  # for
-            name = element["py_name"]
-            if name not in outs:
+        name = element["py_name"]
+        if name not in outs:
+            # Use 'expr' for Vensim models, and 'eqn' for Xmile
+            # (This makes the Vensim equation prettier.)
+            eqn = element["expr"] if "expr" in element else element["eqn"]
+            parent_name = element["parent_name"] if "parent_name" in element\
+                else None
+            outs[name] = {
+                "py_name": element["py_name"],
+                "real_name": element["real_name"],
+                "doc": element["doc"],
+                "py_expr": [element["py_expr"]],  # in a list
+                "unit": element["unit"],
+                "subs": [element["subs"]],
+                "merge_subs": element["merge_subs"]
+                if "merge_subs" in element else None,
+                "dependencies": element["dependencies"]
+                if "dependencies" in element else None,
+                "lims": element["lims"],
+                "eqn": [eqn.replace(r"\ ", "")],
+                "parent_name": parent_name,
+                "kind": element["kind"],
+                "arguments": element["arguments"],
+            }
 
-                # Use 'expr' for Vensim models, and 'eqn' for Xmile
-                # (This makes the Vensim equation prettier.)
-                eqn = element["expr"] if "expr" in element else element["eqn"]
-                outs[name] = {
-                    "py_name": element["py_name"],
-                    "real_name": element["real_name"],
-                    "doc": element["doc"],
-                    "py_expr": [element["py_expr"]],  # in a list
-                    "unit": element["unit"],
-                    "subs": [element["subs"]],
-                    "merge_subs": element["merge_subs"]
-                    if "merge_subs" in element else None,
-                    "dependencies": element["dependencies"]
-                    if "dependencies" in element else None,
-                    "lims": element["lims"],
-                    "eqn": [eqn.replace(r"\ ", "")],
-                    "kind": element["kind"],
-                    "arguments": element["arguments"],
-                }
+        else:
+            eqn = element["expr"] if "expr" in element else element["eqn"]
 
-            else:
-                eqn = element["expr"] if "expr" in element else element["eqn"]
-
-                outs[name]["doc"] = outs[name]["doc"] or element["doc"]
-                outs[name]["unit"] = outs[name]["unit"] or element["unit"]
-                outs[name]["lims"] = outs[name]["lims"] or element["lims"]
-                outs[name]["eqn"] += [eqn.replace(r"\ ", "")]
-                outs[name]["py_expr"] += [element["py_expr"]]
-                outs[name]["subs"] += [element["subs"]]
-                if outs[name]["dependencies"] is not None:
-                    if name.startswith("_"):
-                        # stateful object merge initial and step
-                        for target in outs[name]["dependencies"]:
-                            _merge_dependencies(
-                                outs[name]["dependencies"][target],
-                                element["dependencies"][target])
-                    else:
-                        # regular element
+            outs[name]["doc"] = outs[name]["doc"] or element["doc"]
+            outs[name]["unit"] = outs[name]["unit"] or element["unit"]
+            outs[name]["lims"] = outs[name]["lims"] or element["lims"]
+            outs[name]["eqn"] += [eqn.replace(r"\ ", "")]
+            outs[name]["py_expr"] += [element["py_expr"]]
+            outs[name]["subs"] += [element["subs"]]
+            if outs[name]["dependencies"] is not None:
+                if name.startswith("_"):
+                    # stateful object merge initial and step
+                    for target in outs[name]["dependencies"]:
                         _merge_dependencies(
-                            outs[name]["dependencies"],
-                            element["dependencies"])
-                outs[name]["arguments"] = element["arguments"]
+                            outs[name]["dependencies"][target],
+                            element["dependencies"][target])
+                else:
+                    # regular element
+                    _merge_dependencies(
+                        outs[name]["dependencies"],
+                        element["dependencies"])
+            outs[name]["arguments"] = element["arguments"]
 
     return list(outs.values())
 
@@ -823,6 +820,63 @@ def _merge_dependencies(current, new):
         current[dep] = new[dep]
 
 
+def build_active_initial_deps(identifier, arguments, deps):
+    """
+    Creates new model element dictionaries for the model elements associated
+    with a stock.
+
+    Parameters
+    ----------
+    identifier: str
+        The python-safe name of the stock.
+
+    expression: str
+        Formula which forms the regular value for active initial.
+
+    initial: str
+        Formula which forms the initial value for active initial.
+
+    deps: dict
+        The dictionary with all the denpendencies in the expression.
+
+    Returns
+    -------
+    reference: str
+        A reference to the gost variable that defines the dependencies.
+
+    new_structure: list
+        List of additional model element dictionaries.
+
+    """
+    deps = build_dependencies(
+        deps,
+        {
+            "initial": [arguments[1]],
+            "step": [arguments[0]]
+        })
+
+    py_name = "_active_initial_%s" % identifier
+
+    # describe the stateful object
+    new_structure = [{
+        "py_name": py_name,
+        "parent_name": "",
+        "real_name": "",
+        "doc": "",
+        "py_expr": "",
+        "unit": "",
+        "lims": "",
+        "eqn": "",
+        "subs": "",
+        "merge_subs": None,
+        "dependencies": deps,
+        "kind": "dependencies",
+        "arguments": "",
+    }]
+
+    return py_name, new_structure
+
+
 def add_stock(identifier, expression, initial_condition, subs, merge_subs,
               deps):
     """
@@ -847,6 +901,9 @@ def add_stock(identifier, expression, initial_condition, subs, merge_subs,
     merge_subs: list of strings
         List of the final subscript range of the python array after
         merging with other objects.
+
+    deps: dict
+        The dictionary with all the denpendencies in the expression.
 
     Returns
     -------
@@ -980,6 +1037,9 @@ def add_delay(identifier, delay_input, delay_time, initial_value, order,
         List of the final subscript range of the python array after
         merging with other objects.
 
+    deps: dict
+        The dictionary with all the denpendencies in the expression.
+
     Returns
     -------
     reference: str
@@ -1098,6 +1158,9 @@ def add_delay_f(identifier, delay_input, delay_time, initial_value, deps):
         We initialize the stocks with equal values so that the outflow in
         the first timestep is equal to this value.
 
+    deps: dict
+        The dictionary with all the denpendencies in the expression.
+
     Returns
     -------
     reference: str
@@ -1187,6 +1250,9 @@ def add_n_delay(identifier, delay_input, delay_time, initial_value, order,
     merge_subs: list of strings
         List of the final subscript range of the python array after
         merging with other objects.
+
+    deps: dict
+        The dictionary with all the denpendencies in the expression.
 
     Returns
     -------
@@ -1306,6 +1372,9 @@ def add_forecast(identifier, forecast_input, average_time, horizon,
         List of the final subscript range of the python array after
         merging with other objects.
 
+    deps: dict
+        The dictionary with all the denpendencies in the expression.
+
     Returns
     -------
     reference: str
@@ -1408,6 +1477,9 @@ def add_sample_if_true(identifier, condition, actual_value, initial_value,
     merge_subs: list of strings
         List of the final subscript range of the python array after
         merging with other objects.
+
+    deps: dict
+        The dictionary with all the denpendencies in the expression.
 
     Returns
     -------
@@ -1513,8 +1585,10 @@ def add_n_smooth(identifier, smooth_input, smooth_time, initial_value, order,
         list of expressions, and collectively define the shape of the output
 
     merge_subs: list of strings
-        List of the final subscript range of the python array after
-       .
+        List of the final subscript range of the python array after.
+
+    deps: dict
+        The dictionary with all the denpendencies in the expression.
 
     Returns
     -------
@@ -1634,6 +1708,9 @@ def add_n_trend(identifier, trend_input, average_time, initial_trend,
         List of the final subscript range of the python array after
         merging with other objects.
 
+    deps: dict
+        The dictionary with all the denpendencies in the expression.
+
     Returns
     -------
     reference: str
@@ -1720,6 +1797,9 @@ def add_initial(identifier, value, deps):
         The expression which will be evaluated, and the first value of
         which returned.
 
+    deps: dict
+        The dictionary with all the denpendencies in the expression.
+
     Returns
     -------
     reference: str
@@ -1757,6 +1837,73 @@ def add_initial(identifier, value, deps):
     }
 
     return "%s()" % stateful["py_name"], [stateful]
+
+
+def add_tab_data(identifier, real_name, subs,
+                 subscript_dict, merge_subs, keyword):
+    """
+    Constructs an object for handling Vensim's regular DATA components.
+
+    Parameters
+    ----------
+    identifier: str
+        The python-safe name of the external values.
+
+    real_name: str
+        The real name of the variable.
+
+    subs: list of strings
+        List of strings of subscript indices that correspond to the
+        list of expressions, and collectively define the shape of the output.
+
+    subscript_dict: dict
+        Dictionary describing the possible dimensions of the stock's
+        subscripts.
+
+    merge_subs: list of strings
+        List of the final subscript range of the python array after
+        merging with other objects.
+
+    keyword: str
+        Data retrieval method ('interpolate', 'look forward', 'hold backward').
+
+    Returns
+    -------
+    reference: str
+        Reference to the TabData object `__call__` method, which will
+        return the retrieved value of data for the current time step.
+
+    new_structure: list
+        List of element construction dictionaries for the builder to assemble.
+
+    """
+    Imports.add("data", "TabData")
+
+    coords = utils.simplify_subscript_input(
+        utils.make_coord_dict(subs, subscript_dict, terse=False),
+        subscript_dict, return_full=False, merge_subs=merge_subs)
+    keyword = (
+        "'%s'" % keyword.strip(":").lower() if isinstance(keyword, str) else
+        keyword)
+    name = "_data_%s" % identifier
+
+    data = {
+        "py_name": name,
+        "parent_name": identifier,
+        "real_name": "Data for %s" % identifier,
+        "doc": "Provides data for data variable %s" % identifier,
+        "py_expr": "TabData('%s', '%s', %s, %s)" % (
+            real_name, identifier, coords, keyword),
+        "unit": "None",
+        "lims": "None",
+        "eqn": "None",
+        "subs": subs,
+        "merge_subs": merge_subs,
+        "kind": "tab_data",
+        "arguments": "",
+    }
+
+    return "%s(time())" % data["py_name"], [data]
 
 
 def add_ext_data(identifier, file_name, tab, time_row_or_col, cell, subs,
@@ -2072,7 +2219,7 @@ def add_macro(identifier, macro_name, filename, arg_names, arg_vals, deps):
         "parent_name": identifier,
         "real_name": "Macro Instantiation of " + macro_name,
         "doc": "Instantiates the Macro",
-        "py_expr": "Macro('%s', %s, '%s',"
+        "py_expr": "Macro(_root.joinpath('%s'), %s, '%s',"
         " time_initialization=lambda: __data['time'],"
         " py_name='%s')" % (filename, func_args, macro_name, py_name),
         "unit": "None",

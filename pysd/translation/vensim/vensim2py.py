@@ -4,10 +4,11 @@ module to write a python version of the model. Everything that requires
 knowledge of vensim syntax should be here.
 """
 
-import os
+import pathlib
 import re
 import warnings
 from io import open
+from chardet import detect
 
 import numpy as np
 import parsimonious
@@ -15,7 +16,9 @@ from parsimonious.exceptions import IncompleteParseError,\
                                     VisitationError,\
                                     ParseError
 
-from .. import builder, utils, external
+from .. import builder, utils
+from ...py_backend.external import ExtSubscript
+from ...py_backend.utils import compute_shape
 
 
 def get_file_sections(file_str):
@@ -299,10 +302,11 @@ def get_equation_components(equation_str, root_path=None):
 
     component_structure_grammar = _include_common_grammar(
         r"""
-    entry = component / data_definition / test_definition / subscript_definition / lookup_definition / subscript_copy
+    entry = component / ext_data_definition / data_definition / test_definition / subscript_definition / lookup_definition / subscript_copy
     component = name _ subscriptlist? _ "=" "="? _ expression
     subscript_definition = name _ ":" _ (imported_subscript / literal_subscript / numeric_range) _ subscript_mapping_list?
-    data_definition = name _ subscriptlist? _ keyword? _ ":=" _ expression
+    ext_data_definition = name _ subscriptlist? _ keyword? _ ":=" _ expression
+    data_definition = name _ subscriptlist? _ keyword
     lookup_definition = name _ subscriptlist? &"(" _ expression  # uses
     # lookahead assertion to capture whole group
     test_definition = name _ subscriptlist? _ &keyword _ expression
@@ -356,6 +360,9 @@ def get_equation_components(equation_str, root_path=None):
         def visit_component(self, n, vc):
             self.kind = "component"
 
+        def visit_ext_data_definition(self, n, vc):
+            self.kind = "component"
+
         def visit_data_definition(self, n, vc):
             self.kind = "data"
 
@@ -371,8 +378,7 @@ def get_equation_components(equation_str, root_path=None):
             # TODO: allow reading the subscripts from Excel
             # once the model has been translated
             args = [x.strip().strip("'") for x in vc[4].split(",")]
-            self.subscripts += external.ExtSubscript(*args, root=root_path
-                                                     ).subscript
+            self.subscripts += ExtSubscript(*args, root=root_path).subscript
 
         def visit_subscript_copy(self, n, vc):
             self.kind = "subdef"
@@ -1221,6 +1227,12 @@ def parse_general_expression(element, namespace={}, subscript_dict={},
                 arguments += ["dim=" + str(tuple(self.apply_dim))]
                 self.apply_dim = set()
 
+            if re.match(r"active(_|\s)initial", function_name):
+                ghost_name, new_structure = builder.build_active_initial_deps(
+                    element["py_name"], arguments, element["dependencies"])
+                element["dependencies"] = {ghost_name: 1}
+                self.new_structure += new_structure
+
             return builder.build_function_call(
                 functions[function_name],
                 arguments, element["dependencies"])
@@ -1358,7 +1370,7 @@ def parse_general_expression(element, namespace={}, subscript_dict={},
                 if ";" in n.text or "," in n.text:
                     text = n.text.strip(";").replace(" ", "").replace(";", ",")
                     data = np.array([float(s) for s in text.split(",")])
-                    data = data.reshape(utils.compute_shape(coords))
+                    data = data.reshape(compute_shape(coords))
                     datastr = (
                         np.array2string(data, separator=",")
                         .replace("\n", "")
@@ -1673,8 +1685,7 @@ def translate_section(section, macro_list, sketch, root_path, subview_sep=""):
 
     # Parse components to python syntax.
     for element in model_elements:
-        if (element["kind"] == "component" and "py_expr" not in element) or \
-           (element["kind"] == "data"):
+        if element["kind"] == "component" and "py_expr" not in element:
             # TODO: if there is new structure,
             # it should be added to the namespace...
             translation, new_structure = parse_general_expression(
@@ -1686,6 +1697,16 @@ def translate_section(section, macro_list, sketch, root_path, subview_sep=""):
                 elements_subs_dict=elements_subs_dict
             )
             element.update(translation)
+            model_elements += new_structure
+
+        elif element["kind"] == "data":
+            element["eqn"] = element["expr"] = element["arguments"] = ""
+            element["py_expr"], new_structure = builder.add_tab_data(
+                element["py_name"], element["real_name"],
+                element["subs"], subscript_dict, element["merge_subs"],
+                element["keyword"])
+
+            element["dependencies"] = {"time": 1, "__data__": None}
             model_elements += new_structure
 
         elif element["kind"] == "lookup":
@@ -1727,15 +1748,15 @@ def translate_section(section, macro_list, sketch, root_path, subview_sep=""):
                 subscript_dict,
                 namespace,
                 dependencies,
-                section["file_name"],
+                section["file_path"],
                 module_elements,
             )
-            return section["file_name"]
+            return section["file_path"]
 
     builder.build(build_elements, subscript_dict, namespace, dependencies,
-                  section["file_name"])
+                  section["file_path"])
 
-    return section["file_name"]
+    return section["file_path"]
 
 
 def _classify_elements_by_module(sketch, namespace, subview_sep):
@@ -1856,13 +1877,13 @@ def _split_sketch(text):
     return text, sketch
 
 
-def translate_vensim(mdl_file, split_views, **kwargs):
+def translate_vensim(mdl_file, split_views, encoding=None, **kwargs):
     """
     Translate a vensim file.
 
     Parameters
     ----------
-    mdl_file: str
+    mdl_file: str or pathlib.PosixPath
         File path of a vensim model file to translate to python.
 
     split_views: bool
@@ -1870,6 +1891,11 @@ def translate_vensim(mdl_file, split_views, **kwargs):
         model view, and then translate each view in a separate python
         file. Setting this argument to True is recommended for large
         models that are split in many different views.
+
+    encoding: str or None (optional)
+        Encoding of the source model file. If None, the encoding will be
+        read from the model, if the encoding is not defined in the model
+        file it will be set to 'UTF-8'. Default is None.
 
     **kwargs: (optional)
         Additional parameters passed to the translate_vensim function
@@ -1887,20 +1913,26 @@ def translate_vensim(mdl_file, split_views, **kwargs):
     # character used to place subviews in the parent view folder
     subview_sep = kwargs.get("subview_sep", "")
 
-    root_path = os.path.split(mdl_file)[0]
-    with open(mdl_file, "r", encoding="UTF-8") as in_file:
-        text = in_file.read()
+    if isinstance(mdl_file, str):
+        mdl_file = pathlib.Path(mdl_file)
 
     # check for model extension
-    if not mdl_file.lower().endswith(".mdl"):
+    if mdl_file.suffix.lower() != ".mdl":
         raise ValueError(
             "The file to translate, "
-            + mdl_file
+            + str(mdl_file)
             + " is not a vensim model. It must end with mdl extension."
         )
-    mdl_insensitive = re.compile(re.escape('.mdl'), re.IGNORECASE)
-    outfile_name = mdl_insensitive.sub(".py", mdl_file)
-    out_dir = os.path.dirname(outfile_name)
+
+    root_path = mdl_file.parent
+
+    if encoding is None:
+        encoding = _detect_encoding_from_file(mdl_file)
+
+    with open(mdl_file, "r", encoding=encoding, errors="ignore") as in_file:
+        text = in_file.read()
+
+    outfile_name = mdl_file.with_suffix(".py")
 
     if split_views:
         text, sketch = _split_sketch(text)
@@ -1911,13 +1943,12 @@ def translate_vensim(mdl_file, split_views, **kwargs):
 
     for section in file_sections:
         if section["name"] == "_main_":
-            section["file_name"] = outfile_name
+            section["file_path"] = outfile_name
         else:  # separate macro elements into their own files
             section["py_name"] = utils.make_python_identifier(
                 section["name"])
-            section["file_name"] = os.path.join(
-                out_dir,
-                section["py_name"] + ".py")
+            section["file_name"] = section["py_name"] + ".py"
+            section["file_path"] = root_path.joinpath(section["file_name"])
 
     macro_list = [s for s in file_sections if s["name"] != "_main_"]
 
@@ -1925,3 +1956,17 @@ def translate_vensim(mdl_file, split_views, **kwargs):
         translate_section(section, macro_list, sketch, root_path, subview_sep)
 
     return outfile_name
+
+
+def _detect_encoding_from_file(mdl_file):
+
+    try:
+        with open(mdl_file, "rb") as in_file:
+            f_line = in_file.readline()
+        f_line = f_line.decode(detect(f_line)['encoding'])
+        return re.search(r"(?<={)(.*)(?=})", f_line).group()
+    except (AttributeError, UnicodeDecodeError):
+        warnings.warn(
+            "No encoding specified or detected to translate the model "
+            "file. 'UTF-8' encoding will be used.")
+        return "UTF-8"
